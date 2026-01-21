@@ -16,9 +16,8 @@ from pydantic import BaseModel, Field
 # --- Configuration ---
 # In a real production environment, these should be environment variables.
 # Hardcoded based on specific prompt instructions.
-# ZOOM_SECRET = "UR6GqxUNSj-rFvVuQqy9_w"
-# GHL_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJsb2NhdGlvbl9pZCI6InN4Uk9jUWlUMXlIaGlwWXlVVmtmIiwidmVyc2lvbiI6MSwiaWF0IjoxNzU1NzY1ODUwNDA3LCJzdWIiOiJNc3pDSnk0TGZhUlJBbXRXd3l5cCJ9.vPu8roNC4fBhxPL_kEbejgfmR2Cy1qOw92AUrNsW_0c"
-# GHL_LOCATION_ID = "sxROcQiT1yHhipYyUVkf"
+# ZOOM_SECRET = os.getenv("ZOOM_WEBHOOK_SECRET")
+# GHL_API_KEY = os.getenv(GHL_API_KEY) 
 # GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # Assumed to be in env
 
 # Configure Logging
