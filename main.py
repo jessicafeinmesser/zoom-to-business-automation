@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 # Environment Variables
 ZOOM_WEBHOOK_SECRET = os.getenv("ZOOM_WEBHOOK_SECRET", "UR6GqxUNSj-rFvVuQqy9_w")
+# !!! UPDATE THIS KEY - The current one is returning 401 Unauthorized !!!
 GHL_API_KEY = os.getenv("GHL_API_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJsb2NhdGlvbl9pZCI6InN4Uk9jUWlUMXlIaGlwWXlVVmtmIiwidmVyc2lvbiI6MSwiaWF0IjoxNzU1NzY1ODUwNDA3LCJzdWIiOiJNc3pDSnk0TGZhUlJBbXRXd3l5cCJ9.vPu8roNC4fBhxPL_kEbejgfmR2Cy1qOw92AUrNsW_0c")
 GHL_LOCATION_ID = os.getenv("GHL_LOCATION_ID", "sxROcQiT1yHhipYyUVkf")
 GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -46,7 +47,13 @@ def get_ghl_contact(email: str) -> Optional[str]:
     try:
         url = f"{GHL_BASE_URL}/contacts/"
         params = {"locationId": GHL_LOCATION_ID, "query": email, "limit": 1}
-        response = requests.get(url, headers=GHL_HEADERS, params=params)
+        # We refresh headers here in case you updated the env var
+        headers = {
+            "Authorization": f"Bearer {os.getenv('GHL_API_KEY', GHL_API_KEY)}",
+            "Version": "2021-07-28",
+            "Content-Type": "application/json"
+        }
+        response = requests.get(url, headers=headers, params=params)
         response.raise_for_status()
         contacts = response.json().get("contacts", [])
         return contacts[0]["id"] if contacts else None
@@ -58,11 +65,16 @@ def create_ghl_note(contact_id: str, note_content: str):
     try:
         url = f"{GHL_BASE_URL}/contacts/{contact_id}/notes"
         payload = {"body": note_content}
-        response = requests.post(url, headers=GHL_HEADERS, json=payload)
+        headers = {
+            "Authorization": f"Bearer {os.getenv('GHL_API_KEY', GHL_API_KEY)}",
+            "Version": "2021-07-28",
+            "Content-Type": "application/json"
+        }
+        response = requests.post(url, headers=headers, json=payload)
         response.raise_for_status()
-        logger.info(f"GHL Note added to {contact_id}")
+        logger.info(f"Successfully added note to GHL contact {contact_id}")
     except Exception as e:
-        logger.error(f"GHL Note Error: {e}")
+        logger.error(f"GHL Note Creation Failed: {e}")
 
 # ------------------------------------------------------------------------------
 # CORE LOGIC
@@ -98,19 +110,11 @@ def process_recording_logic(download_url: str, email: str, download_token: str):
             logger.error(f"File failed to become active: {file_upload.state.name}")
             return
 
-        time.sleep(10) # Settle delay
+        time.sleep(10)
 
-        # 3. Dynamic Model Selection (FIXED FOR YOUR KEY)
+        # 3. Model Selection
         available_names = [m.name for m in genai.list_models()]
-        
-        # We look for 'gemini-flash-latest' first as it was in your log list
-        if "models/gemini-flash-latest" in available_names:
-            chosen_model = "models/gemini-flash-latest"
-        elif "models/gemini-1.5-flash" in available_names:
-            chosen_model = "models/gemini-1.5-flash"
-        else:
-            # Fallback: pick the first thing that looks like a flash model
-            chosen_model = next((name for name in available_names if "flash" in name), "models/gemini-1.5-flash")
+        chosen_model = "models/gemini-flash-latest" if "models/gemini-flash-latest" in available_names else "models/gemini-1.5-flash"
 
         # 4. Generate Content
         logger.info(f"Requesting generation from {chosen_model}...")
@@ -122,7 +126,7 @@ def process_recording_logic(download_url: str, email: str, download_token: str):
             "2. Summary (in the detected language).\n"
             "3. Full Business Plan (in the detected language).\n"
             "4. A short note for a CRM system.\n\n"
-            "Maintain the structure and professional tone."
+            "Respond clearly and professionally."
         )
 
         response = model.generate_content([file_upload, prompt], request_options={"timeout": 600})
@@ -131,12 +135,17 @@ def process_recording_logic(download_url: str, email: str, download_token: str):
             logger.error("AI returned empty response.")
             return
 
+        # LOG THE RESULT so you have it even if GHL fails
+        logger.info(f"--- AI ANALYSIS COMPLETE FOR {email} ---")
+        logger.info(response.text)
+        logger.info("--- END OF ANALYSIS ---")
+
         # 5. Send to GHL
         contact_id = get_ghl_contact(email)
         if contact_id:
             create_ghl_note(contact_id, response.text)
         else:
-            logger.warning(f"Analysis generated but no GHL contact found for {email}.")
+            logger.warning(f"No GHL contact found for {email}. Ensure the contact exists in GHL first.")
 
     except Exception as e:
         logger.error(f"Process Error: {e}")
@@ -184,7 +193,7 @@ async def zoom_webhook(request: Request, background_tasks: BackgroundTasks):
 
 @app.get("/")
 def home():
-    return {"status": "online"}
+    return {"status": "online", "message": "Ready to process Zoom recordings."}
 
 if __name__ == "__main__":
     import uvicorn
