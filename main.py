@@ -98,33 +98,31 @@ def process_recording_logic(download_url: str, email: str, download_token: str):
             logger.error(f"File failed to become active: {file_upload.state.name}")
             return
 
-        time.sleep(8) # Short settle delay
+        time.sleep(10) # Settle delay
 
-        # 3. Dynamic Model Selection (Fixes the 404 Error)
-        # We try the most stable full path first
-        chosen_model = "models/gemini-1.5-flash" 
+        # 3. Dynamic Model Selection (FIXED FOR YOUR KEY)
+        available_names = [m.name for m in genai.list_models()]
         
-        try:
-            # Check if our chosen model is in the allowed list for this API key
-            available_names = [m.name for m in genai.list_models()]
-            logger.info(f"Models available to this key: {available_names}")
-            
-            if chosen_model not in available_names:
-                # If the exact path isn't there, find anything that contains 'gemini-1.5-flash'
-                fallback = next((name for name in available_names if "gemini-1.5-flash" in name), None)
-                if fallback:
-                    chosen_model = fallback
-                    logger.info(f"Switched to fallback model: {chosen_model}")
-        except Exception as e:
-            logger.warning(f"Could not list models, attempting with default. Error: {e}")
+        # We look for 'gemini-flash-latest' first as it was in your log list
+        if "models/gemini-flash-latest" in available_names:
+            chosen_model = "models/gemini-flash-latest"
+        elif "models/gemini-1.5-flash" in available_names:
+            chosen_model = "models/gemini-1.5-flash"
+        else:
+            # Fallback: pick the first thing that looks like a flash model
+            chosen_model = next((name for name in available_names if "flash" in name), "models/gemini-1.5-flash")
 
         # 4. Generate Content
         logger.info(f"Requesting generation from {chosen_model}...")
         model = genai.GenerativeModel(model_name=chosen_model)
         
         prompt = (
-            "Analyze this meeting recording. Determine the language (Hebrew or English). "
-            "Provide a concise Summary, a Full Business Plan, and a CRM Note in that language."
+            "Analyze this meeting recording and provide:\n"
+            "1. Detected Language (Hebrew/English).\n"
+            "2. Summary (in the detected language).\n"
+            "3. Full Business Plan (in the detected language).\n"
+            "4. A short note for a CRM system.\n\n"
+            "Maintain the structure and professional tone."
         )
 
         response = model.generate_content([file_upload, prompt], request_options={"timeout": 600})
@@ -176,6 +174,7 @@ async def zoom_webhook(request: Request, background_tasks: BackgroundTasks):
 
             if email and download_url and download_token:
                 background_tasks.add_task(process_recording_logic, download_url, email, download_token)
+                logger.info(f"Webhook received. Queued processing for {email}")
                 return {"status": "queued"}
 
         return {"status": "ignored"}
