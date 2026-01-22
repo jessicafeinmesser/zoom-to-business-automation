@@ -17,67 +17,67 @@ import google.generativeai as genai
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Environment Variables
+# Environment Variables - Set these in Render Dashboard for security
 ZOOM_WEBHOOK_SECRET = os.getenv("ZOOM_WEBHOOK_SECRET", "UR6GqxUNSj-rFvVuQqy9_w")
-# !!! UPDATE THIS KEY - The current one is returning 401 Unauthorized !!!
-GHL_API_KEY = os.getenv("GHL_API_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJsb2NhdGlvbl9pZCI6InN4Uk9jUWlUMXlIaGlwWXlVVmtmIiwidmVyc2lvbiI6MSwiaWF0IjoxNzU1NzY1ODUwNDA3LCJzdWIiOiJNc3pDSnk0TGZhUlJBbXRXd3l5cCJ9.vPu8roNC4fBhxPL_kEbejgfmR2Cy1qOw92AUrNsW_0c")
+GHL_API_KEY = os.getenv("GHL_API_KEY", "PASTE_YOUR_NEW_KEY_HERE")
 GHL_LOCATION_ID = os.getenv("GHL_LOCATION_ID", "sxROcQiT1yHhipYyUVkf")
 GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY")
-
-if not GOOGLE_API_KEY:
-    logger.error("GEMINI_API_KEY missing!")
 
 genai.configure(api_key=GOOGLE_API_KEY)
 
 # GHL API Configuration
 GHL_BASE_URL = "https://services.leadconnectorhq.com"
-GHL_HEADERS = {
-    "Authorization": f"Bearer {GHL_API_KEY}",
-    "Version": "2021-07-28",
-    "Content-Type": "application/json"
-}
 
 app = FastAPI()
 
 # ------------------------------------------------------------------------------
-# HELPERS
+# GHL HELPERS
 # ------------------------------------------------------------------------------
 
+def get_ghl_headers():
+    """Returns fresh headers using the current API Key."""
+    return {
+        "Authorization": f"Bearer {os.getenv('GHL_API_KEY', GHL_API_KEY)}",
+        "Version": "2021-07-28",
+        "Content-Type": "application/json"
+    }
+
 def get_ghl_contact(email: str) -> Optional[str]:
+    """Find a GHL Contact ID by email."""
     try:
         url = f"{GHL_BASE_URL}/contacts/"
         params = {"locationId": GHL_LOCATION_ID, "query": email, "limit": 1}
-        # We refresh headers here in case you updated the env var
-        headers = {
-            "Authorization": f"Bearer {os.getenv('GHL_API_KEY', GHL_API_KEY)}",
-            "Version": "2021-07-28",
-            "Content-Type": "application/json"
-        }
-        response = requests.get(url, headers=headers, params=params)
+        
+        response = requests.get(url, headers=get_ghl_headers(), params=params)
+        
+        if response.status_code == 401:
+            logger.error("GHL ERROR: 401 Unauthorized. Your API Key is likely invalid or expired.")
+            return None
+            
         response.raise_for_status()
         contacts = response.json().get("contacts", [])
-        return contacts[0]["id"] if contacts else None
+        
+        if contacts:
+            return contacts[0]["id"]
+        return None
     except Exception as e:
-        logger.error(f"GHL Search Error: {e}")
+        logger.error(f"GHL Search Error for {email}: {e}")
         return None
 
 def create_ghl_note(contact_id: str, note_content: str):
+    """Post analysis as a note to the contact."""
     try:
         url = f"{GHL_BASE_URL}/contacts/{contact_id}/notes"
         payload = {"body": note_content}
-        headers = {
-            "Authorization": f"Bearer {os.getenv('GHL_API_KEY', GHL_API_KEY)}",
-            "Version": "2021-07-28",
-            "Content-Type": "application/json"
-        }
-        response = requests.post(url, headers=headers, json=payload)
+        
+        response = requests.post(url, headers=get_ghl_headers(), json=payload)
         response.raise_for_status()
         logger.info(f"Successfully added note to GHL contact {contact_id}")
     except Exception as e:
         logger.error(f"GHL Note Creation Failed: {e}")
 
 # ------------------------------------------------------------------------------
-# CORE LOGIC
+# PROCESSING LOGIC
 # ------------------------------------------------------------------------------
 
 def process_recording_logic(download_url: str, email: str, download_token: str):
@@ -85,9 +85,9 @@ def process_recording_logic(download_url: str, email: str, download_token: str):
     file_upload = None
 
     try:
-        logger.info(f"Processing recording for {email}")
+        logger.info(f"--- Starting Process for {email} ---")
 
-        # 1. Download Video
+        # 1. Download
         auth_url = f"{download_url}?access_token={download_token}"
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
             temp_file_path = tmp.name
@@ -96,59 +96,51 @@ def process_recording_logic(download_url: str, email: str, download_token: str):
                 for chunk in r.iter_content(chunk_size=16384):
                     tmp.write(chunk)
         
-        logger.info(f"Download complete. Size: {os.path.getsize(temp_file_path)} bytes.")
+        logger.info(f"Download complete ({os.path.getsize(temp_file_path)} bytes).")
 
-        # 2. Upload to Gemini
-        logger.info("Uploading to Gemini...")
+        # 2. Gemini Upload
         file_upload = genai.upload_file(temp_file_path, mime_type="video/mp4")
-        
         while file_upload.state.name == "PROCESSING":
             time.sleep(5)
             file_upload = genai.get_file(file_upload.name)
         
         if file_upload.state.name != "ACTIVE":
-            logger.error(f"File failed to become active: {file_upload.state.name}")
+            logger.error("Gemini failed to activate file.")
             return
 
-        time.sleep(10)
+        time.sleep(10) # Wait for indexing
 
-        # 3. Model Selection
+        # 3. Model Selection (Dynamic)
         available_names = [m.name for m in genai.list_models()]
         chosen_model = "models/gemini-flash-latest" if "models/gemini-flash-latest" in available_names else "models/gemini-1.5-flash"
 
-        # 4. Generate Content
-        logger.info(f"Requesting generation from {chosen_model}...")
+        # 4. Generate Analysis
+        logger.info(f"Analyzing with {chosen_model}...")
         model = genai.GenerativeModel(model_name=chosen_model)
-        
         prompt = (
-            "Analyze this meeting recording and provide:\n"
-            "1. Detected Language (Hebrew/English).\n"
-            "2. Summary (in the detected language).\n"
-            "3. Full Business Plan (in the detected language).\n"
-            "4. A short note for a CRM system.\n\n"
-            "Respond clearly and professionally."
+            "Analyze this recording. Detect the language (Hebrew or English).\n"
+            "Provide:\n1. Summary\n2. Business Plan\n3. CRM Note\n"
+            "Respond ONLY in the detected language."
         )
 
         response = model.generate_content([file_upload, prompt], request_options={"timeout": 600})
         
         if not response.text:
-            logger.error("AI returned empty response.")
+            logger.error("AI returned empty text.")
             return
 
-        # LOG THE RESULT so you have it even if GHL fails
-        logger.info(f"--- AI ANALYSIS COMPLETE FOR {email} ---")
-        logger.info(response.text)
-        logger.info("--- END OF ANALYSIS ---")
+        # LOGGING the output so you have it in Render logs if GHL fails
+        logger.info(f"AI ANALYSIS RESULT FOR {email}:\n{response.text}")
 
-        # 5. Send to GHL
+        # 5. GHL Integration
         contact_id = get_ghl_contact(email)
         if contact_id:
             create_ghl_note(contact_id, response.text)
         else:
-            logger.warning(f"No GHL contact found for {email}. Ensure the contact exists in GHL first.")
+            logger.warning(f"No GHL contact found for {email}. Cannot upload note.")
 
     except Exception as e:
-        logger.error(f"Process Error: {e}")
+        logger.error(f"Background Process Error: {e}")
     finally:
         if temp_file_path and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
@@ -159,7 +151,7 @@ def process_recording_logic(download_url: str, email: str, download_token: str):
                 pass
 
 # ------------------------------------------------------------------------------
-# WEBHOOK ENDPOINT
+# FASTAPI ROUTES
 # ------------------------------------------------------------------------------
 
 @app.post("/zoom-webhook")
@@ -169,11 +161,13 @@ async def zoom_webhook(request: Request, background_tasks: BackgroundTasks):
         event = data.get("event")
         payload = data.get("payload", {})
 
+        # URL Validation (Zoom Handshake)
         if event == "endpoint.url_validation":
             token = payload.get("plainToken")
             hashed = hmac.new(ZOOM_WEBHOOK_SECRET.encode(), token.encode(), hashlib.sha256).hexdigest()
             return {"plainToken": token, "encryptedToken": hashed}
 
+        # Recording Event
         if event == "recording.completed":
             download_token = data.get("download_token")
             obj = payload.get("object", {})
@@ -183,7 +177,7 @@ async def zoom_webhook(request: Request, background_tasks: BackgroundTasks):
 
             if email and download_url and download_token:
                 background_tasks.add_task(process_recording_logic, download_url, email, download_token)
-                logger.info(f"Webhook received. Queued processing for {email}")
+                logger.info(f"Webhook received. Queued: {email}")
                 return {"status": "queued"}
 
         return {"status": "ignored"}
@@ -192,8 +186,8 @@ async def zoom_webhook(request: Request, background_tasks: BackgroundTasks):
         return {"error": str(e)}
 
 @app.get("/")
-def home():
-    return {"status": "online", "message": "Ready to process Zoom recordings."}
+def health():
+    return {"status": "online"}
 
 if __name__ == "__main__":
     import uvicorn
