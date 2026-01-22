@@ -18,9 +18,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Environment Variables
-ZOOM_WEBHOOK_SECRET = os.getenv("ZOOM_WEBHOOK_SECRET", "UR6GqxUNSj-rFvVuQqy9_w")
-GHL_API_KEY = os.getenv("GHL_API_KEY", "REPLACE_WITH_FRESH_KEY")
-GHL_LOCATION_ID = os.getenv("GHL_LOCATION_ID", "sxROcQiT1yHhipYyUVkf")
+ZOOM_WEBHOOK_SECRET = os.getenv("ZOOM_WEBHOOK_SECRET")
+GHL_API_KEY = os.getenv("GHL_API_KEY")
+GHL_LOCATION_ID = os.getenv("GHL_LOCATION_ID")
 GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Exclusion List (Your own emails)
