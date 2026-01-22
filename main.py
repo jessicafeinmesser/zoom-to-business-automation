@@ -8,7 +8,6 @@ import tempfile
 import requests
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
-from pydantic import BaseModel
 import google.generativeai as genai
 
 # ------------------------------------------------------------------------------
@@ -25,18 +24,11 @@ GHL_LOCATION_ID = os.getenv("GHL_LOCATION_ID", "sxROcQiT1yHhipYyUVkf")
 GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not GOOGLE_API_KEY:
-    logger.error("GEMINI_API_KEY not found! Script will fail to analyze recordings.")
+    logger.error("GEMINI_API_KEY missing!")
 
 genai.configure(api_key=GOOGLE_API_KEY)
 
-# Log available models to help with debugging 404 errors
-try:
-    available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-    logger.info(f"Available Gemini Models for this API Key: {available_models}")
-except Exception as e:
-    logger.warning(f"Could not list models: {e}")
-
-# GHL API Configuration (V2)
+# GHL API Configuration
 GHL_BASE_URL = "https://services.leadconnectorhq.com"
 GHL_HEADERS = {
     "Authorization": f"Bearer {GHL_API_KEY}",
@@ -44,10 +36,10 @@ GHL_HEADERS = {
     "Content-Type": "application/json"
 }
 
-app = FastAPI(title="Zoom to GHL Integration")
+app = FastAPI()
 
 # ------------------------------------------------------------------------------
-# GHL HELPERS
+# HELPERS
 # ------------------------------------------------------------------------------
 
 def get_ghl_contact(email: str) -> Optional[str]:
@@ -59,7 +51,7 @@ def get_ghl_contact(email: str) -> Optional[str]:
         contacts = response.json().get("contacts", [])
         return contacts[0]["id"] if contacts else None
     except Exception as e:
-        logger.error(f"GHL search error for {email}: {e}")
+        logger.error(f"GHL Search Error: {e}")
         return None
 
 def create_ghl_note(contact_id: str, note_content: str):
@@ -68,9 +60,9 @@ def create_ghl_note(contact_id: str, note_content: str):
         payload = {"body": note_content}
         response = requests.post(url, headers=GHL_HEADERS, json=payload)
         response.raise_for_status()
-        logger.info(f"GHL Note created for contact {contact_id}")
+        logger.info(f"GHL Note added to {contact_id}")
     except Exception as e:
-        logger.error(f"GHL Note creation error: {e}")
+        logger.error(f"GHL Note Error: {e}")
 
 # ------------------------------------------------------------------------------
 # CORE LOGIC
@@ -81,7 +73,7 @@ def process_recording_logic(download_url: str, email: str, download_token: str):
     file_upload = None
 
     try:
-        logger.info(f"Processing recording for: {email}")
+        logger.info(f"Processing recording for {email}")
 
         # 1. Download Video
         auth_url = f"{download_url}?access_token={download_token}"
@@ -89,59 +81,67 @@ def process_recording_logic(download_url: str, email: str, download_token: str):
             temp_file_path = tmp.name
             with requests.get(auth_url, stream=True) as r:
                 r.raise_for_status()
-                if 'text/html' in r.headers.get('Content-Type', ''):
-                    logger.error("Download failed: Received HTML instead of MP4.")
-                    return
                 for chunk in r.iter_content(chunk_size=16384):
                     tmp.write(chunk)
         
-        file_size = os.path.getsize(temp_file_path)
-        logger.info(f"Download complete. Size: {file_size} bytes.")
+        logger.info(f"Download complete. Size: {os.path.getsize(temp_file_path)} bytes.")
 
         # 2. Upload to Gemini
         logger.info("Uploading to Gemini...")
         file_upload = genai.upload_file(temp_file_path, mime_type="video/mp4")
         
-        # 3. Poll for Processing
         while file_upload.state.name == "PROCESSING":
             time.sleep(5)
             file_upload = genai.get_file(file_upload.name)
         
         if file_upload.state.name != "ACTIVE":
-            logger.error(f"Gemini processing state: {file_upload.state.name}")
+            logger.error(f"File failed to become active: {file_upload.state.name}")
             return
 
-        # Settle delay
-        time.sleep(10)
+        time.sleep(8) # Short settle delay
 
-        # 4. Generate Analysis
-        # Using 'gemini-1.5-flash-latest' to resolve the 404 error
-        model_name = "gemini-1.5-flash-latest"
-        logger.info(f"Analyzing with {model_name}...")
-        model = genai.GenerativeModel(model_name)
+        # 3. Dynamic Model Selection (Fixes the 404 Error)
+        # We try the most stable full path first
+        chosen_model = "models/gemini-1.5-flash" 
+        
+        try:
+            # Check if our chosen model is in the allowed list for this API key
+            available_names = [m.name for m in genai.list_models()]
+            logger.info(f"Models available to this key: {available_names}")
+            
+            if chosen_model not in available_names:
+                # If the exact path isn't there, find anything that contains 'gemini-1.5-flash'
+                fallback = next((name for name in available_names if "gemini-1.5-flash" in name), None)
+                if fallback:
+                    chosen_model = fallback
+                    logger.info(f"Switched to fallback model: {chosen_model}")
+        except Exception as e:
+            logger.warning(f"Could not list models, attempting with default. Error: {e}")
+
+        # 4. Generate Content
+        logger.info(f"Requesting generation from {chosen_model}...")
+        model = genai.GenerativeModel(model_name=chosen_model)
         
         prompt = (
-            "Analyze this meeting recording and provide:\n"
-            "1. Detected Language (Hebrew/English).\n"
-            "2. Summary (in the detected language).\n"
-            "3. Full Business Plan (in the detected language).\n"
-            "4. A short note for a CRM system.\n\n"
-            "Maintain the structure and professional tone."
+            "Analyze this meeting recording. Determine the language (Hebrew or English). "
+            "Provide a concise Summary, a Full Business Plan, and a CRM Note in that language."
         )
 
         response = model.generate_content([file_upload, prompt], request_options={"timeout": 600})
-        result_text = response.text
-        logger.info("AI Analysis completed.")
+        
+        if not response.text:
+            logger.error("AI returned empty response.")
+            return
 
-        # 5. GHL Integration
+        # 5. Send to GHL
         contact_id = get_ghl_contact(email)
         if contact_id:
-            create_ghl_note(contact_id, result_text)
+            create_ghl_note(contact_id, response.text)
         else:
-            logger.warning(f"No GHL contact found for {email}. Results log: \n{result_text[:200]}...")
+            logger.warning(f"Analysis generated but no GHL contact found for {email}.")
 
     except Exception as e:
-        logger.error(f"Background process failed: {e}")
+        logger.error(f"Process Error: {e}")
     finally:
         if temp_file_path and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
@@ -152,50 +152,40 @@ def process_recording_logic(download_url: str, email: str, download_token: str):
                 pass
 
 # ------------------------------------------------------------------------------
-# ENDPOINTS
+# WEBHOOK ENDPOINT
 # ------------------------------------------------------------------------------
-
-@app.get("/")
-def health_check():
-    return {"status": "active", "integration": "Zoom-to-GHL"}
 
 @app.post("/zoom-webhook")
 async def zoom_webhook(request: Request, background_tasks: BackgroundTasks):
     try:
-        body = await request.json()
-        event = body.get("event")
-        payload = body.get("payload", {})
+        data = await request.json()
+        event = data.get("event")
+        payload = data.get("payload", {})
 
-        # URL Validation (Handshake)
         if event == "endpoint.url_validation":
-            plain_token = payload.get("plainToken")
-            hashed = hmac.new(
-                ZOOM_WEBHOOK_SECRET.encode("utf-8"),
-                plain_token.encode("utf-8"),
-                hashlib.sha256
-            ).hexdigest()
-            return {"plainToken": plain_token, "encryptedToken": hashed}
+            token = payload.get("plainToken")
+            hashed = hmac.new(ZOOM_WEBHOOK_SECRET.encode(), token.encode(), hashlib.sha256).hexdigest()
+            return {"plainToken": token, "encryptedToken": hashed}
 
-        # Recording Logic
         if event == "recording.completed":
-            download_token = body.get("download_token")
+            download_token = data.get("download_token")
             obj = payload.get("object", {})
             email = obj.get("registrant_email") or obj.get("host_email")
-            
-            # Find MP4
-            download_url = next((f.get("download_url") for f in obj.get("recording_files", []) 
-                                if f.get("file_type") == "MP4"), None)
+            files = obj.get("recording_files", [])
+            download_url = next((f.get("download_url") for f in files if f.get("file_type") == "MP4"), None)
 
-            if all([email, download_url, download_token]):
+            if email and download_url and download_token:
                 background_tasks.add_task(process_recording_logic, download_url, email, download_token)
-                logger.info(f"Queued recording for {email}")
                 return {"status": "queued"}
-            
-        return {"status": "ignored"}
 
+        return {"status": "ignored"}
     except Exception as e:
         logger.error(f"Webhook error: {e}")
-        raise HTTPException(status_code=500)
+        return {"error": str(e)}
+
+@app.get("/")
+def home():
+    return {"status": "online"}
 
 if __name__ == "__main__":
     import uvicorn
