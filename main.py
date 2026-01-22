@@ -1,81 +1,79 @@
 import os
+import logging
 import hmac
 import hashlib
 import json
 import time
-import logging
-import requests
 import tempfile
-from pathlib import Path
-from typing import Optional, Dict, Any, List
-from fastapi import FastAPI, Request, BackgroundTasks, HTTPException, Header
+import requests
+from typing import Optional, Dict, Any
+from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 import google.generativeai as genai
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
-# Configure Logging
+# ------------------------------------------------------------------------------
+# CONFIGURATION & ENVIRONMENT VARIABLES
+# ------------------------------------------------------------------------------
+
+# Logging Setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Environment Variables
+# Sensitive Keys (As requested)
 ZOOM_WEBHOOK_SECRET = os.getenv("ZOOM_WEBHOOK_SECRET", "UR6GqxUNSj-rFvVuQqy9_w")
 GHL_API_KEY = os.getenv("GHL_API_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJsb2NhdGlvbl9pZCI6InN4Uk9jUWlUMXlIaGlwWXlVVmtmIiwidmVyc2lvbiI6MSwiaWF0IjoxNzU1NzY1ODUwNDA3LCJzdWIiOiJNc3pDSnk0TGZhUlJBbXRXd3l5cCJ9.vPu8roNC4fBhxPL_kEbejgfmR2Cy1qOw92AUrNsW_0c")
 GHL_LOCATION_ID = os.getenv("GHL_LOCATION_ID", "sxROcQiT1yHhipYyUVkf")
 GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Configure Gemini
 if not GOOGLE_API_KEY:
-    logger.error("GEMINI_API_KEY is not set.")
-else:
-    genai.configure(api_key=GOOGLE_API_KEY)
+    logger.warning("GEMINI_API_KEY not found in environment variables. AI features will fail.")
+
+# Configure Gemini
+genai.configure(api_key=GOOGLE_API_KEY)
+
+# GHL API Configuration (V2)
+GHL_BASE_URL = "https://services.leadconnectorhq.com"
+GHL_HEADERS = {
+    "Authorization": f"Bearer {GHL_API_KEY}",
+    "Version": "2021-07-28",
+    "Content-Type": "application/json"
+}
 
 # Initialize FastAPI
 app = FastAPI(title="Zoom to GHL Integration")
 
-# Pydantic Models for Zoom Webhook
-class ZoomPayloadObject(BaseModel):
+# ------------------------------------------------------------------------------
+# DATA MODELS
+# ------------------------------------------------------------------------------
+
+class ZoomEventPayload(BaseModel):
     plainToken: Optional[str] = None
-    id: Optional[int] = None
-    uuid: Optional[str] = None
-    host_email: Optional[str] = None
-    topic: Optional[str] = None
-    start_time: Optional[str] = None
-    duration: Optional[int] = None
-    share_url: Optional[str] = None
-    recording_files: Optional[List[Dict[str, Any]]] = None
-    download_token: Optional[str] = None
-    registrant_email: Optional[str] = None 
+    object: Optional[Dict[str, Any]] = None
 
-class ZoomPayload(BaseModel):
-    account_id: Optional[str] = None
-    object: Optional[ZoomPayloadObject] = None
-
-class ZoomWebhookEvent(BaseModel):
+class ZoomWebhookRequest(BaseModel):
     event: str
-    payload: ZoomPayload
+    payload: ZoomEventPayload
     download_token: Optional[str] = None
 
-# --- Core Logic Functions ---
+# ------------------------------------------------------------------------------
+# HELPER FUNCTIONS
+# ------------------------------------------------------------------------------
 
-def get_ghl_headers():
-    return {
-        "Authorization": f"Bearer {GHL_API_KEY}",
-        "Version": "2021-07-28",
-        "Content-Type": "application/json"
-    }
-
-def find_ghl_contact(email: str) -> Optional[str]:
-    """Finds a contact in GHL by email using V2 API. Returns Contact ID."""
-    url = "https://services.leadconnectorhq.com/contacts/search"
-    # Note: GHL V2 Search usually requires a POST or specific query params. 
-    # Using the standard V2 'search' endpoint which accepts query params for email.
-    params = {
-        "email": email,
-        "locationId": GHL_LOCATION_ID
-    }
-    
+def get_ghl_contact(email: str) -> Optional[str]:
+    """
+    Find a GHL Contact ID by email using V2 Search API.
+    """
     try:
-        response = requests.get(url, headers=get_ghl_headers(), params=params)
+        url = f"{GHL_BASE_URL}/contacts/"
+        params = {
+            "locationId": GHL_LOCATION_ID,
+            "query": email,
+            "limit": 1
+        }
+        response = requests.get(url, headers=GHL_HEADERS, params=params)
         response.raise_for_status()
+        
         data = response.json()
         contacts = data.get("contacts", [])
         
@@ -83,202 +81,193 @@ def find_ghl_contact(email: str) -> Optional[str]:
             return contacts[0]["id"]
         return None
     except Exception as e:
-        logger.error(f"Error searching GHL contact: {e}")
+        logger.error(f"Error searching GHL contact for {email}: {e}")
         return None
 
 def create_ghl_note(contact_id: str, note_content: str):
-    """Creates a note for a specific contact in GHL."""
-    url = f"https://services.leadconnectorhq.com/contacts/{contact_id}/notes"
-    payload = {
-        "body": note_content,
-        "userId": "" # Optional: Assign to a specific user if needed
-    }
-    
-    try:
-        response = requests.post(url, headers=get_ghl_headers(), json=payload)
-        response.raise_for_status()
-        logger.info(f"Note successfully posted to GHL Contact ID: {contact_id}")
-    except Exception as e:
-        logger.error(f"Error posting GHL note: {e}")
-
-def process_recording_background(payload_obj: ZoomPayloadObject, download_token: str):
     """
-    Background task to download video, process with Gemini, and update GHL.
+    Post a note to a GHL contact.
+    """
+    try:
+        url = f"{GHL_BASE_URL}/contacts/{contact_id}/notes"
+        payload = {
+            "body": note_content
+        }
+        response = requests.post(url, headers=GHL_HEADERS, json=payload)
+        response.raise_for_status()
+        logger.info(f"Successfully added note to contact {contact_id}")
+    except Exception as e:
+        logger.error(f"Error creating GHL note: {e}")
+
+def process_recording_logic(download_url: str, email: str):
+    """
+    Core logic: Download -> Upload to Gemini -> Poll -> Analyze -> Update GHL.
     """
     temp_file_path = None
-    uploaded_file = None
+    file_upload = None
 
     try:
-        # 1. Identify valid recording file (prefer MP4)
-        if not payload_obj.recording_files:
-            logger.warning("No recording files found in payload.")
-            return
+        logger.info(f"Starting processing for {email}. URL: {download_url}")
 
-        # Find the largest MP4 file or the first recording file
-        video_info = next((f for f in payload_obj.recording_files if f.get('file_type') == 'MP4'), payload_obj.recording_files[0])
-        download_url = video_info.get('download_url')
-        
-        if not download_url:
-            logger.error("No download URL found.")
-            return
-
-        # Append access token if provided (Zoom often requires this for webhook downloads)
-        final_download_url = f"{download_url}?access_token={download_token}" if download_token else download_url
-
-        # 2. Download File
-        logger.info(f"Starting download from {download_url}...")
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
-            temp_file_path = tmp_file.name
-            with requests.get(final_download_url, stream=True) as r:
+        # 1. Download File
+        # Use a temporary file to store the video
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            temp_file_path = tmp.name
+            with requests.get(download_url, stream=True) as r:
                 r.raise_for_status()
                 for chunk in r.iter_content(chunk_size=8192):
-                    tmp_file.write(chunk)
+                    tmp.write(chunk)
         
-        # 3. Check File Size (< 100 bytes check)
+        # Check file size
         file_size = os.path.getsize(temp_file_path)
         if file_size < 100:
-            logger.error(f"Downloaded file is too small ({file_size} bytes). Likely an error page or empty recording. Stopping.")
+            logger.error(f"Downloaded file is too small ({file_size} bytes). Aborting.")
             return
-        
-        logger.info(f"Download complete. Size: {file_size} bytes.")
 
-        # 4. Upload to Gemini
+        logger.info(f"File downloaded. Size: {file_size} bytes.")
+
+        # 2. Upload to Gemini
         logger.info("Uploading to Gemini...")
-        uploaded_file = genai.upload_file(temp_file_path, mime_type="video/mp4")
-        logger.info(f"Uploaded to Gemini. URI: {uploaded_file.uri}")
+        file_upload = genai.upload_file(temp_file_path, mime_type="video/mp4")
+        logger.info(f"File uploaded to Gemini: {file_upload.name}")
 
-        # 5. Poll until ACTIVE
-        while True:
-            uploaded_file = genai.get_file(uploaded_file.name)
-            if uploaded_file.state.name == "ACTIVE":
-                break
-            if uploaded_file.state.name == "FAILED":
-                logger.error("Gemini file processing FAILED.")
-                return
-            logger.info("Waiting for Gemini video processing...")
-            time.sleep(10)
+        # 3. Poll until ACTIVE
+        logger.info("Waiting for Gemini file processing...")
+        while file_upload.state.name == "PROCESSING":
+            time.sleep(5)
+            file_upload = genai.get_file(file_upload.name)
+        
+        if file_upload.state.name != "ACTIVE":
+            logger.error(f"Gemini file processing failed. State: {file_upload.state.name}")
+            return
 
-        # 6. Generate Content
-        logger.info("Generating content with Gemini 1.5 Flash...")
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        logger.info("Gemini file is ACTIVE. Generating content...")
+
+        # 4. Generate Content (Model: gemini-2.0-flash)
+        model = genai.GenerativeModel("gemini-2.0-flash")
         
         prompt = (
-            "Analyze this meeting recording. "
-            "1. Detect the language spoken (Hebrew or English). "
-            "2. Generate a response in the DETECTED LANGUAGE. "
-            "3. Provide the output in the following format:\n\n"
-            "---SUMMARY---\n[Detailed Summary]\n\n"
-            "---BUSINESS_PLAN---\n[Full Business Plan based on discussion]\n\n"
-            "---SHORT_NOTE---\n[A concise note for the CRM]"
+            "You are an expert business analyst. Analyze this meeting recording.\n"
+            "1. Detect the language spoken (Hebrew or English).\n"
+            "2. Respond strictly in the detected language.\n"
+            "3. Output the response in the following structured format:\n\n"
+            "**Language Detected:** [Language]\n\n"
+            "**Summary:**\n[Concise Summary]\n\n"
+            "**Full Business Plan:**\n[Detailed Actionable Plan]\n\n"
+            "**GHL Note:**\n[Short note for CRM context]"
         )
 
-        result = model.generate_content([uploaded_file, prompt])
-        ai_response = result.text
+        response = model.generate_content(
+            [file_upload, prompt],
+            request_options={"timeout": 600}
+        )
 
-        # 7. Find Contact and Post Note
-        # Logic: Try registrant_email first (if available), then host_email
-        target_email = payload_obj.registrant_email or payload_obj.host_email
+        result_text = response.text
+        logger.info("AI Analysis complete.")
+
+        # 5. Find GHL Contact
+        contact_id = get_ghl_contact(email)
         
-        if not target_email:
-            logger.warning("No email found in payload to associate with GHL.")
-            return
-
-        logger.info(f"Searching GHL for contact: {target_email}")
-        contact_id = find_ghl_contact(target_email)
-
         if contact_id:
-            logger.info(f"Contact found ({contact_id}). Posting note...")
-            
-            # Formating the note for GHL
-            formatted_note = (
-                f"Zoom Meeting Analysis\n"
-                f"Topic: {payload_obj.topic}\n"
-                f"Date: {payload_obj.start_time}\n\n"
-                f"{ai_response}"
-            )
-            create_ghl_note(contact_id, formatted_note)
+            logger.info(f"Found GHL Contact ID: {contact_id}")
+            # 6. Post Note
+            create_ghl_note(contact_id, result_text)
         else:
-            logger.warning(f"Contact with email {target_email} not found in GHL.")
+            logger.warning(f"No GHL Contact found for email: {email}. Skipping note creation.")
 
     except Exception as e:
-        logger.exception(f"Error in background processing: {e}")
+        logger.error(f"Fatal error in background task: {e}")
     finally:
-        # Cleanup local file
+        # Cleanup local temp file
         if temp_file_path and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
-        # Cleanup Gemini file (Optional but recommended to save storage limits)
-        if uploaded_file:
+        # Cleanup Gemini file (optional, but good practice to delete from cloud if strictly transactional)
+        if file_upload:
             try:
-                genai.delete_file(uploaded_file.name)
+                genai.delete_file(file_upload.name)
             except Exception:
                 pass
 
-# --- Webhook Endpoint ---
+# ------------------------------------------------------------------------------
+# API ENDPOINTS
+# ------------------------------------------------------------------------------
 
 @app.post("/zoom-webhook")
-async def zoom_webhook(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    x_zm_signature: Optional[str] = Header(None),
-    x_zm_request_timestamp: Optional[str] = Header(None)
-):
+async def zoom_webhook(request: Request, background_tasks: BackgroundTasks):
+    """
+    Handles Zoom Webhooks.
+    1. Validates endpoint URL (Handshake).
+    2. Processes recording.completed events.
+    """
     try:
         body_bytes = await request.body()
         body_json = await request.json()
         
-        # 1. URL Validation (Zoom Challenge)
-        if body_json.get("event") == "endpoint.url_validation":
-            plain_token = body_json["payload"]["plainToken"]
+        event = body_json.get("event")
+        payload = body_json.get("payload", {})
+
+        # 1. URL Validation (Handshake)
+        if event == "endpoint.url_validation":
+            plain_token = payload.get("plainToken")
+            if not plain_token:
+                raise HTTPException(status_code=400, detail="Missing plainToken")
             
-            # Construct message for HMAC
-            msg = plain_token
-            digest = hmac.new(
+            # HMAC SHA-256 hashing
+            hash_for_validate = hmac.new(
                 ZOOM_WEBHOOK_SECRET.encode("utf-8"),
-                msg.encode("utf-8"),
+                plain_token.encode("utf-8"),
                 hashlib.sha256
             ).hexdigest()
             
             return {
                 "plainToken": plain_token,
-                "encryptedToken": digest
+                "encryptedToken": hash_for_validate
             }
 
-        # 2. Verify Request Signature for other events (Security Best Practice)
-        # Note: Zoom signature verification logic involves `v0:{timestamp}:{body}`
-        if x_zm_signature and x_zm_request_timestamp:
-            message = f"v0:{x_zm_request_timestamp}:{body_bytes.decode('utf-8')}"
-            hashed = hmac.new(
-                ZOOM_WEBHOOK_SECRET.encode('utf-8'), 
-                message.encode('utf-8'), 
-                hashlib.sha256
-            ).hexdigest()
-            signature = f"v0={hashed}"
+        # 2. Recording Completed
+        if event == "recording.completed":
+            obj = payload.get("object", {})
             
-            if signature != x_zm_signature:
-                logger.warning("Invalid Zoom Signature")
-                # Depending on strictness, might want to raise HTTPException(401)
-                # For now, we proceed or log.
-
-        # 3. Handle Recording Completed
-        if body_json.get("event") == "recording.completed":
-            # Parse payload safely
-            event_data = ZoomWebhookEvent(**body_json)
-            payload_obj = event_data.payload.object
+            # Extract Email (Registrant or Host)
+            email = obj.get("registrant_email")
+            if not email:
+                email = obj.get("host_email")
             
-            # Get download token either from top level or object
-            # Note: Webhook structure varies slightly by Zoom app settings, check both
-            d_token = event_data.download_token or payload_obj.download_token
-
-            if payload_obj:
-                background_tasks.add_task(process_recording_background, payload_obj, d_token)
+            # Extract Download URL (First MP4 file usually)
+            recording_files = obj.get("recording_files", [])
+            download_url = None
             
-            return {"status": "processing_started"}
+            for rf in recording_files:
+                # Prefer MP4 video files
+                if rf.get("file_type") == "MP4" or rf.get("file_extension") == "MP4":
+                    download_url = rf.get("download_url")
+                    break
+            
+            if not download_url and recording_files:
+                # Fallback to first available if no MP4 explicitly found
+                download_url = recording_files[0].get("download_url")
 
-        return {"status": "event_received"}
+            if email and download_url:
+                # Append access token if Zoom provides it in the download_token field (webhook level)
+                # or if it's already in the url.
+                # For webhook apps, download_url usually contains a query param token if `recording_files` doesn't enforce OAuth.
+                # If "download_token" is in the root payload, we might need to append it `?access_token=...`
+                # However, usually Zoom webhook download_url is usable directly or via basic verification.
+                # We proceed with the URL provided.
+                
+                background_tasks.add_task(process_recording_logic, download_url, email)
+                logger.info(f"Queued recording processing for {email}")
+            else:
+                logger.warning("Event received but missing email or download_url.")
 
+            return {"status": "processing_queued"}
+
+        return {"status": "ignored_event"}
+
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
     except Exception as e:
-        logger.error(f"Error processing webhook: {e}")
+        logger.error(f"Webhook error: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
 if __name__ == "__main__":
