@@ -68,7 +68,7 @@ def create_ghl_note(contact_id: str, note_content: str):
         logger.error(f"Error creating GHL note: {e}")
 
 def process_recording_logic(download_url: str, email: str, download_token: str):
-    """Core logic: Download (with token) -> Upload to Gemini -> Analyze -> Update GHL."""
+    """Core logic: Download -> Gemini (1.5 Flash) -> Analyze -> GHL."""
     temp_file_path = None
     file_upload = None
 
@@ -76,28 +76,25 @@ def process_recording_logic(download_url: str, email: str, download_token: str):
         logger.info(f"Starting processing for {email}...")
 
         # 1. Download File with Authorization Token
-        # Zoom requires the access_token query param to bypass the login page
         authenticated_url = f"{download_url}?access_token={download_token}"
         
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
             temp_file_path = tmp.name
             with requests.get(authenticated_url, stream=True) as r:
                 r.raise_for_status()
-                
-                # Verify we aren't just downloading a small HTML login page
                 content_type = r.headers.get('Content-Type', '')
                 if 'text/html' in content_type:
-                    logger.error("Download failed: Received HTML instead of a video. Check Zoom Webhook Secret/Token.")
+                    logger.error("Download failed: Received HTML login page.")
                     return
 
                 for chunk in r.iter_content(chunk_size=8192):
                     tmp.write(chunk)
         
         file_size = os.path.getsize(temp_file_path)
-        logger.info(f"File downloaded successfully. Size: {file_size} bytes.")
+        logger.info(f"File downloaded. Size: {file_size} bytes.")
 
-        if file_size < 100000:  # If less than 100KB, it's likely not a video
-            logger.error("Downloaded file is too small to be a recording. Aborting.")
+        if file_size < 50000:
+            logger.error("File size too small. Likely not a video.")
             return
 
         # 2. Upload to Gemini
@@ -105,17 +102,21 @@ def process_recording_logic(download_url: str, email: str, download_token: str):
         file_upload = genai.upload_file(temp_file_path, mime_type="video/mp4")
         
         # 3. Wait for Gemini processing
-        logger.info(f"Waiting for Gemini to process file: {file_upload.name}")
+        logger.info(f"Waiting for Gemini processing: {file_upload.name}")
         while file_upload.state.name == "PROCESSING":
             time.sleep(5)
             file_upload = genai.get_file(file_upload.name)
         
         if file_upload.state.name != "ACTIVE":
-            logger.error(f"Gemini processing failed. State: {file_upload.state.name}")
+            logger.error(f"Gemini processing failed: {file_upload.state.name}")
             return
 
-        # 4. Generate Content
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        # Small delay to ensure the file is indexed across Google's servers
+        time.sleep(10)
+
+        # 4. Generate Content (Switching to 1.5-flash for better quota availability)
+        logger.info("Generating analysis using gemini-1.5-flash...")
+        model = genai.GenerativeModel("gemini-1.5-flash")
         prompt = (
             "You are an expert business analyst. Analyze this meeting recording.\n"
             "1. Detect the language spoken (Hebrew or English).\n"
@@ -127,7 +128,11 @@ def process_recording_logic(download_url: str, email: str, download_token: str):
             "**GHL Note:**\n[Short note for CRM context]"
         )
 
-        response = model.generate_content([file_upload, prompt], request_options={"timeout": 600})
+        response = model.generate_content(
+            [file_upload, prompt], 
+            request_options={"timeout": 600}
+        )
+        
         result_text = response.text
         logger.info("AI Analysis complete.")
 
@@ -141,6 +146,7 @@ def process_recording_logic(download_url: str, email: str, download_token: str):
     except Exception as e:
         logger.error(f"Fatal error in background task: {e}")
     finally:
+        # Cleanup
         if temp_file_path and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
         if file_upload:
@@ -160,7 +166,6 @@ async def zoom_webhook(request: Request, background_tasks: BackgroundTasks):
         event = body_json.get("event")
         payload = body_json.get("payload", {})
 
-        # 1. URL Validation (Handshake)
         if event == "endpoint.url_validation":
             plain_token = payload.get("plainToken")
             hash_for_validate = hmac.new(
@@ -170,17 +175,13 @@ async def zoom_webhook(request: Request, background_tasks: BackgroundTasks):
             ).hexdigest()
             return {"plainToken": plain_token, "encryptedToken": hash_for_validate}
 
-        # 2. Recording Completed
         if event == "recording.completed":
-            # The download_token is at the top level of the payload for recording events
             download_token = body_json.get("download_token")
             obj = payload.get("object", {})
-            
             email = obj.get("registrant_email") or obj.get("host_email")
             
-            # Find the MP4 file URL
-            download_url = None
             recording_files = obj.get("recording_files", [])
+            download_url = None
             for rf in recording_files:
                 if rf.get("file_type") == "MP4" or rf.get("file_extension") == "MP4":
                     download_url = rf.get("download_url")
@@ -190,8 +191,6 @@ async def zoom_webhook(request: Request, background_tasks: BackgroundTasks):
                 background_tasks.add_task(process_recording_logic, download_url, email, download_token)
                 logger.info(f"Queued processing for {email}")
                 return {"status": "queued"}
-            else:
-                logger.warning("Missing required fields (email, url, or token)")
 
         return {"status": "ignored"}
 
