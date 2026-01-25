@@ -6,6 +6,7 @@ import json
 import time
 import tempfile
 import requests
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 import google.generativeai as genai
@@ -23,7 +24,7 @@ GHL_API_KEY = os.getenv("GHL_API_KEY")
 GHL_LOCATION_ID = os.getenv("GHL_LOCATION_ID")
 GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Add your personal/support emails here to skip processing them
+# Exclusion List (Host/Personal Emails)
 EXCLUDED_EMAILS = ["support@fullbookai.com"]
 
 genai.configure(api_key=GOOGLE_API_KEY)
@@ -43,26 +44,48 @@ def get_ghl_headers():
     }
 
 def find_client_email_from_ghl(zoom_id: str) -> Optional[str]:
-    """Finds client email by searching for the Zoom Link in GHL Appointments."""
+    """
+    Searches GHL calendar events to find the client booked for this Zoom ID.
+    Fixed: Uses the correct V2 /calendars/events endpoint.
+    """
     try:
-        url = f"{GHL_BASE_URL}/appointments/"
-        params = {"locationId": GHL_LOCATION_ID, "includeUpcoming": "true"}
+        # Define search window: 1 hour before and after current time
+        now = datetime.utcnow()
+        start_time = int((now - timedelta(hours=2)).timestamp() * 1000)
+        end_time = int((now + timedelta(hours=2)).timestamp() * 1000)
+
+        # Correct V2 Endpoint for listing events/appointments
+        url = f"{GHL_BASE_URL}/calendars/events"
+        params = {
+            "locationId": GHL_LOCATION_ID,
+            "startTime": start_time,
+            "endTime": end_time
+        }
+        
         response = requests.get(url, headers=get_ghl_headers(), params=params)
         response.raise_for_status()
-        appointments = response.json().get("appointments", [])
+        events = response.json().get("events", [])
 
-        for appt in appointments:
-            location = appt.get("location", "")
-            if zoom_id in location:
-                contact_id = appt.get("contactId")
+        logger.info(f"Searching through {len(events)} GHL events for Zoom ID: {zoom_id}")
+
+        for event in events:
+            # Check the address/location field for the Zoom ID
+            address = event.get("address", "")
+            if zoom_id in address:
+                contact_id = event.get("contactId")
                 if contact_id:
+                    # Look up contact to get their email
                     c_url = f"{GHL_BASE_URL}/contacts/{contact_id}"
                     c_resp = requests.get(c_url, headers=get_ghl_headers())
                     c_resp.raise_for_status()
-                    return c_resp.json().get("contact", {}).get("email")
+                    email = c_resp.json().get("contact", {}).get("email")
+                    if email:
+                        logger.info(f"Found client email: {email}")
+                        return email
+        
         return None
     except Exception as e:
-        logger.error(f"GHL Appointment Lookup Error: {e}")
+        logger.error(f"Error looking up GHL event for Zoom ID {zoom_id}: {e}")
         return None
 
 def get_ghl_contact(email: str) -> Optional[str]:
@@ -74,31 +97,17 @@ def get_ghl_contact(email: str) -> Optional[str]:
         contacts = response.json().get("contacts", [])
         return contacts[0]["id"] if contacts else None
     except Exception as e:
-        logger.error(f"GHL search error: {e}")
+        logger.error(f"GHL contact search error: {e}")
         return None
 
 def create_ghl_note(contact_id: str, note_content: str):
-    """Post analysis as a note to the contact with safety checks."""
     try:
-        if not note_content or len(note_content.strip()) < 10:
-            logger.warning("Note content is too short or empty. Skipping GHL upload.")
-            return
-
         url = f"{GHL_BASE_URL}/contacts/{contact_id}/notes"
-        
-        # Ensure we are sending valid JSON
         payload = {"body": note_content}
-        
-        response = requests.post(url, headers=get_ghl_headers(), json=payload)
-        
-        if response.status_code == 401:
-            logger.error("GHL ERROR: 401 Unauthorized. Please refresh your GHL API Key in Render.")
-            return
-
-        response.raise_for_status()
-        logger.info(f"Successfully added Business Plan note to contact {contact_id}")
+        requests.post(url, headers=get_ghl_headers(), json=payload).raise_for_status()
+        logger.info(f"Note successfully added to contact {contact_id}")
     except Exception as e:
-        logger.error(f"GHL Note Creation Failed: {e}")
+        logger.error(f"Failed to create GHL note: {e}")
 
 # ------------------------------------------------------------------------------
 # CORE LOGIC
@@ -109,7 +118,7 @@ def process_recording_logic(download_url: str, client_email: str, download_token
     file_upload = None
 
     try:
-        logger.info(f"--- Starting Analysis for {client_email} ---")
+        logger.info(f"--- Processing Analysis for Client: {client_email} ---")
 
         # 1. Download Video
         auth_url = f"{download_url}?access_token={download_token}"
@@ -120,32 +129,22 @@ def process_recording_logic(download_url: str, client_email: str, download_token
                 for chunk in r.iter_content(chunk_size=16384):
                     tmp.write(chunk)
         
-        logger.info(f"Download complete. Size: {os.path.getsize(temp_file_path)} bytes.")
-
-        # 2. Upload to Gemini
+        # 2. Gemini Upload
         file_upload = genai.upload_file(temp_file_path, mime_type="video/mp4")
         while file_upload.state.name == "PROCESSING":
             time.sleep(10)
             file_upload = genai.get_file(file_upload.name)
         
         if file_upload.state.name != "ACTIVE":
-            logger.error(f"Gemini file state failed: {file_upload.state.name}")
+            logger.error("File upload failed to become ACTIVE.")
             return
 
-        # CRITICAL: Wait 20 seconds for the AI to "index" the video content
-        logger.info("File active. Waiting 20s for internal indexing...")
-        time.sleep(20)
+        time.sleep(20) # Essential buffer for AI indexing
 
-        # 3. Dynamic Model Picker
+        # 3. Model & Safety Setup
         available_names = [m.name for m in genai.list_models()]
-        if "models/gemini-flash-latest" in available_names:
-            chosen_model = "models/gemini-flash-latest"
-        elif "models/gemini-1.5-flash" in available_names:
-            chosen_model = "models/gemini-1.5-flash"
-        else:
-            chosen_model = next((n for n in available_names if "flash" in n), "models/gemini-1.5-flash")
-
-        # 4. Safety Settings (Prevents Empty Responses)
+        chosen_model = "models/gemini-flash-latest" if "models/gemini-flash-latest" in available_names else "models/gemini-1.5-flash"
+        
         safety_settings = {
             HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
@@ -153,35 +152,28 @@ def process_recording_logic(download_url: str, client_email: str, download_token
             HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
         }
 
-        # 5. Generate Content
-        logger.info(f"Requesting analysis from {chosen_model}...")
+        # 4. Generate Analysis
+        logger.info(f"Running AI analysis using {chosen_model}...")
         model = genai.GenerativeModel(model_name=chosen_model)
         prompt = (
-            "Analyze this meeting recording carefully. Detect the language (Hebrew or English).\n"
-            "Provide:\n1. Summary\n2. Detailed Business Plan\n3. CRM Note\n"
-            "Respond ONLY in the detected language."
+            "Analyze this meeting recording carefully. Detect the language (Hebrew or English). "
+            "Provide a Summary, Business Plan, and CRM Note in the detected language. "
+            "Respond in a detailed and professional tone."
         )
 
-        response = model.generate_content(
-            [file_upload, prompt],
-            safety_settings=safety_settings
-        )
+        response = model.generate_content([file_upload, prompt], safety_settings=safety_settings)
         
-        # Check for blocked response
-        if not response.candidates or not response.candidates[0].content.parts:
-            logger.error(f"AI blocked the response. Feedback: {response.prompt_feedback}")
+        if not response.text:
+            logger.error(f"AI returned empty result. Feedback: {response.prompt_feedback}")
             return
 
-        result_text = response.text
-        logger.info("AI Analysis completed.")
-
-        # 6. Save to GHL
+        # 5. GHL Integration
         contact_id = get_ghl_contact(client_email)
         if contact_id:
-            create_ghl_note(contact_id, result_text)
-            logger.info(f"Successfully uploaded note for {client_email}")
+            create_ghl_note(contact_id, response.text)
+            logger.info(f"Successfully uploaded Business Plan for {client_email}")
         else:
-            logger.warning(f"Analysis complete, but {client_email} not found in GHL.")
+            logger.warning(f"Analysis done but contact {client_email} doesn't exist in GHL.")
 
     except Exception as e:
         logger.error(f"Background Process failed: {e}")
@@ -215,14 +207,17 @@ async def zoom_webhook(request: Request, background_tasks: BackgroundTasks):
             obj = payload.get("object", {})
             zoom_id = str(obj.get("id"))
             
-            # Identify Client
+            # Step A: Attempt to identify the client
             client_email = obj.get("registrant_email")
             if not client_email:
+                # Fixed GHL Appointment Lookup
                 client_email = find_client_email_from_ghl(zoom_id)
+            
+            # Step B: Fallback to host if no client found (will be skipped next)
             if not client_email:
                 client_email = obj.get("host_email")
 
-            # Exclusion Check
+            # Step C: Exclusion Check
             if client_email in EXCLUDED_EMAILS:
                 logger.info(f"Skipping: {client_email} is an excluded email.")
                 return {"status": "skipped"}
@@ -233,7 +228,7 @@ async def zoom_webhook(request: Request, background_tasks: BackgroundTasks):
 
             if download_url and download_token:
                 background_tasks.add_task(process_recording_logic, download_url, client_email, download_token)
-                logger.info(f"Queued analysis for: {client_email}")
+                logger.info(f"Queued analysis for client: {client_email}")
                 return {"status": "queued"}
 
         return {"status": "ignored"}
