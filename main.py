@@ -23,62 +23,30 @@ GHL_API_KEY = os.getenv("GHL_API_KEY") # Your Zapier/Business Profile Key
 GHL_LOCATION_ID = os.getenv("GHL_LOCATION_ID")
 GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Emails that belong to you (the host)
+# Your email
 HOST_EMAILS = ["support@fullbookai.com"]
 
 genai.configure(api_key=GOOGLE_API_KEY)
 
-# UPDATED: Using the V1 Base URL for the Zapier Key
+# V1 Base URL for the Zapier Key
 GHL_BASE_URL = "https://api.gohighlevel.com/v1"
 
 app = FastAPI()
 
 # ------------------------------------------------------------------------------
-# GHL HELPERS (V1 COMPATIBLE)
+# GHL HELPERS (V1)
 # ------------------------------------------------------------------------------
 
 def get_ghl_headers():
-    """V1 API Headers for the Zapier Key."""
     return {
         "Authorization": f"Bearer {os.getenv('GHL_API_KEY', GHL_API_KEY)}",
         "Content-Type": "application/json"
     }
 
-def find_client_email_from_ghl(zoom_id: str) -> Optional[str]:
-    """Finds client email using the V1 Appointments API."""
-    try:
-        # V1 Appointment list
-        url = f"{GHL_BASE_URL}/appointments/"
-        params = {"locationId": GHL_LOCATION_ID}
-        
-        response = requests.get(url, headers=get_ghl_headers(), params=params)
-        
-        if response.status_code == 401:
-            logger.error("GHL V1 AUTH ERROR: 401 Unauthorized. Double check your API Key in Render.")
-            return None
-
-        response.raise_for_status()
-        # V1 returns a list of appointments
-        appointments = response.json() if isinstance(response.json(), list) else response.json().get("appointments", [])
-
-        for appt in appointments:
-            # Check location/address for the Zoom ID
-            search_area = str(appt.get("location", "")) + str(appt.get("address", ""))
-            if zoom_id in search_area:
-                contact_id = appt.get("contactId")
-                if contact_id:
-                    # Look up contact in V1
-                    c_url = f"{GHL_BASE_URL}/contacts/{contact_id}"
-                    c_resp = requests.get(c_url, headers=get_ghl_headers())
-                    if c_resp.status_code == 200:
-                        return c_resp.json().get("contact", {}).get("email")
-        return None
-    except Exception as e:
-        logger.error(f"GHL V1 Appointment Lookup Exception: {e}")
-        return None
-
 def get_ghl_contact_id(email: str) -> Optional[str]:
     """Search for contact by email in V1."""
+    if not email or email in HOST_EMAILS:
+        return None
     try:
         url = f"{GHL_BASE_URL}/contacts/"
         params = {"locationId": GHL_LOCATION_ID, "query": email}
@@ -99,19 +67,18 @@ def create_ghl_note(contact_id: str, note_content: str):
         requests.post(url, headers=get_ghl_headers(), json=payload).raise_for_status()
         logger.info(f"Note successfully uploaded to GHL contact {contact_id}")
     except Exception as e:
-        logger.error(f"Failed to upload note to GHL V1: {e}")
+        logger.error(f"Failed to upload note to GHL: {e}")
 
 # ------------------------------------------------------------------------------
 # CORE LOGIC
 # ------------------------------------------------------------------------------
 
-def process_recording_logic(download_url: str, client_email: str, download_token: str):
+def process_recording_logic(download_url: str, identified_email: str, download_token: str):
     temp_file_path = None
     file_upload = None
 
     try:
-        display_email = client_email if client_email else "Client_Email_Not_Detected"
-        logger.info(f"--- Starting Analysis for: {display_email} ---")
+        logger.info(f"--- Starting Analysis. Target Email: {identified_email} ---")
 
         # 1. Download
         auth_url = f"{download_url}?access_token={download_token}"
@@ -122,7 +89,9 @@ def process_recording_logic(download_url: str, client_email: str, download_token
                 for chunk in r.iter_content(chunk_size=16384):
                     tmp.write(chunk)
         
-        # 2. Gemini Upload
+        logger.info(f"Download complete. Size: {os.path.getsize(temp_file_path)} bytes.")
+
+        # 2. Upload to Gemini
         file_upload = genai.upload_file(temp_file_path, mime_type="video/mp4")
         while file_upload.state.name == "PROCESSING":
             time.sleep(10)
@@ -132,9 +101,9 @@ def process_recording_logic(download_url: str, client_email: str, download_token
             logger.error("Gemini failed to process video.")
             return
 
-        time.sleep(20) # AI Indexing Buffer
+        time.sleep(20) # Buffer
 
-        # 3. Model Setup
+        # 3. Model & Safety
         available_names = [m.name for m in genai.list_models()]
         chosen_model = "models/gemini-flash-latest" if "models/gemini-flash-latest" in available_names else "models/gemini-1.5-flash"
         
@@ -159,22 +128,19 @@ def process_recording_logic(download_url: str, client_email: str, download_token
             logger.error("AI response empty.")
             return
 
-        # --- FAIL-SAFE: LOG THE RESULT ---
+        # --- FAIL-SAFE: ALWAYS LOG THE RESULT ---
         result_text = response.text
         logger.info("====================================================")
-        logger.info(f"AI ANALYSIS COMPLETE FOR CLIENT: {display_email}")
+        logger.info(f"AI ANALYSIS RESULT FOR: {identified_email}")
         logger.info("\n" + result_text)
         logger.info("====================================================")
 
         # 5. GHL Upload
-        if client_email and client_email not in HOST_EMAILS:
-            contact_id = get_ghl_contact_id(client_email)
-            if contact_id:
-                create_ghl_note(contact_id, result_text)
-            else:
-                logger.warning(f"Note not uploaded: Contact {client_email} not found in GHL.")
+        contact_id = get_ghl_contact_id(identified_email)
+        if contact_id:
+            create_ghl_note(contact_id, result_text)
         else:
-            logger.info("Note not uploaded: No client identified or meeting was with self.")
+            logger.warning(f"Note not uploaded to CRM: No contact found for {identified_email}")
 
     except Exception as e:
         logger.error(f"Background Task Error: {e}")
@@ -206,21 +172,22 @@ async def zoom_webhook(request: Request, background_tasks: BackgroundTasks):
         if event == "recording.completed":
             download_token = data.get("download_token")
             obj = payload.get("object", {})
-            zoom_id = str(obj.get("id"))
+            duration = obj.get("duration", 0) # Duration in minutes
             
-            # Identify the client
-            client_email = obj.get("registrant_email")
-            if not client_email:
-                client_email = find_client_email_from_ghl(zoom_id)
+            # Identify the client email
+            # 1. Try registrant first
+            email = obj.get("registrant_email")
             
-            # --- FAIL-SAFE ---
-            # Even if GHL lookup fails, we process the video if there's any chance it's a client.
-            # We only skip if the ONLY email Zoom provides is your support email.
-            if not client_email:
-                client_email = obj.get("host_email")
+            # 2. If no registrant, we use the host email as a placeholder for the log
+            # but we won't skip anymore unless it's a tiny 1-minute test.
+            if not email:
+                email = obj.get("host_email")
 
-            if client_email in HOST_EMAILS and not obj.get("registrant_email"):
-                logger.info("Host-only meeting detected. Skipping.")
+            # --- NEW FAIL-SAFE LOGIC ---
+            # If the meeting lasted more than 2 minutes, we assume it's a real meeting
+            # and we process it regardless of whether we found a client email yet.
+            if duration < 5:
+                logger.info(f"Short meeting ({duration} min). Skipping.")
                 return {"status": "skipped"}
 
             # Get MP4 URL
@@ -228,8 +195,8 @@ async def zoom_webhook(request: Request, background_tasks: BackgroundTasks):
                                 if f.get("file_type") == "MP4"), None)
 
             if download_url and download_token:
-                background_tasks.add_task(process_recording_logic, download_url, client_email, download_token)
-                logger.info(f"Queued analysis for: {client_email}")
+                background_tasks.add_task(process_recording_logic, download_url, email, download_token)
+                logger.info(f"Queued analysis for meeting. Identified Email: {email}")
                 return {"status": "queued"}
 
         return {"status": "ignored"}
