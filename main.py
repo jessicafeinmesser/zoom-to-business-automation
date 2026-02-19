@@ -172,4 +172,48 @@ def process_recording_logic(download_url: str, zoom_id: str, zoom_uuid: str, dow
         if contact_id:
             url = f"{GHL_BASE_URL}/contacts/{contact_id}/notes"
             requests.post(url, headers={"Authorization": f"Bearer {GHL_API_KEY}"}, json={"body": result_text})
-            logger.info(f"SUCCESS: Analysis uploaded to G
+            logger.info(f"SUCCESS: Analysis uploaded to GHL for contact {contact_id}")
+        else:
+            logger.error("GHL ERROR: No contact found. Full plan is logged above.")
+
+    except Exception as e:
+        logger.error(f"Critical Processing Error: {e}")
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path): os.remove(temp_file_path)
+        if file_upload: genai.delete_file(file_upload.name)
+
+# ------------------------------------------------------------------------------
+# API ENDPOINT
+# ------------------------------------------------------------------------------
+
+@app.post("/zoom-webhook")
+async def zoom_webhook(request: Request, background_tasks: BackgroundTasks):
+    data = await request.json()
+    event = data.get("event")
+    
+    if event == "endpoint.url_validation":
+        token = data.get("payload", {}).get("plainToken")
+        hashed = hmac.new(ZOOM_WEBHOOK_SECRET.encode(), token.encode(), hashlib.sha256).hexdigest()
+        return {"plainToken": token, "encryptedToken": hashed}
+
+    if event == "recording.completed":
+        payload = data.get("payload", {}).get("object", {})
+        files = payload.get("recording_files", [])
+        
+        # Select the high-quality speaker view MP4 specifically
+        mp4_file = next((f for f in files if f.get("file_type") == "MP4" and "speaker" in f.get("recording_type", "").lower()), None)
+        if not mp4_file: mp4_file = next((f for f in files if f.get("file_type") == "MP4"), None)
+
+        if mp4_file:
+            background_tasks.add_task(
+                process_recording_logic, 
+                mp4_file.get("download_url"), 
+                str(payload.get("id")), 
+                str(payload.get("uuid")), 
+                data.get("download_token")
+            )
+            return {"status": "queued"}
+    return {"status": "ignored"}
+
+@app.get("/")
+def home(): return {"status": "online"}
