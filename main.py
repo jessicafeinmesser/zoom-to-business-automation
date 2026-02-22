@@ -6,6 +6,7 @@ import json
 import time
 import tempfile
 import requests
+import urllib.parse  # Added for proper encoding
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Set
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
@@ -32,8 +33,6 @@ GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=GOOGLE_API_KEY)
 
 HOST_EMAILS = ["support@fullbookai.com", "ofer.rapaport@gmail.com"]
-
-# This prevents the script from running twice for the same meeting
 PROCESSED_UUIDS: Set[str] = set()
 
 app = FastAPI()
@@ -47,32 +46,31 @@ def get_zoom_access_token():
     try:
         response = requests.post(url, auth=(ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET))
         return response.json().get("access_token")
-    except Exception as e:
-        logger.error(f"Zoom Auth Error: {e}")
-        return None
+    except: return None
 
 def get_guest_email_from_zoom(meeting_uuid: str) -> Optional[str]:
     token = get_zoom_access_token()
     if not token: return None
-    safe_uuid = meeting_uuid.replace("/", "%2F").replace("//", "%2F%2F")
-    url = f"https://api.zoom.us/v2/report/meetings/{safe_uuid}/participants"
+    
+    # NEW FIX: Zoom UUIDs with + or / require DOUBLE encoding
+    # This turns '+fZU...' into '%252BfZU...'
+    encoded_uuid = urllib.parse.quote(urllib.parse.quote(meeting_uuid, safe=''), safe='')
+    
+    url = f"https://api.zoom.us/v2/report/meetings/{encoded_uuid}/participants"
     try:
         headers = {"Authorization": f"Bearer {token}"}
         response = requests.get(url, headers=headers)
         participants = response.json().get("participants", [])
         
-        # LOG ALL PARTICIPANTS FOR DEBUGGING
-        logger.info(f"--- ZOOM ATTENDEES FOR {safe_uuid} ---")
+        logger.info(f"--- ZOOM ATTENDEES FOR {meeting_uuid} ---")
         for p in participants:
             email = p.get("user_email")
-            name = p.get("name")
-            logger.info(f"Attendee: {name} | Email: {email}")
-            
+            logger.info(f"Attendee: {p.get('name')} | Email: {email}")
             if email and email.lower() not in [e.lower() for e in HOST_EMAILS]:
                 return email.lower()
         return None
     except Exception as e:
-        logger.error(f"Zoom API Participant Error: {e}")
+        logger.error(f"Zoom API Error: {e}")
         return None
 
 def find_client_by_appointment(zoom_id: str) -> Optional[str]:
@@ -115,7 +113,7 @@ def process_recording_logic(download_url: str, zoom_id: str, zoom_uuid: str, dow
                 logger.info(f"Matched contact via Email: {guest_email}")
         
         if not contact_id:
-            logger.info("Email check failed. Falling back to Appointment search...")
+            logger.info("Email lookup failed. Trying GHL Appointments...")
             contact_id = find_client_by_appointment(zoom_id)
 
         # 2. DOWNLOAD
@@ -126,37 +124,51 @@ def process_recording_logic(download_url: str, zoom_id: str, zoom_uuid: str, dow
                 r.raise_for_status()
                 for chunk in r.iter_content(chunk_size=16384): tmp.write(chunk)
         
-        # 3. GEMINI (Model Auto-Detection)
+        # 3. GEMINI
         file_upload = genai.upload_file(temp_file_path, mime_type="video/mp4")
         while file_upload.state.name == "PROCESSING":
             time.sleep(5)
             file_upload = genai.get_file(file_upload.name)
         
-        # Dynamically find the correct model name
-        available_models = [m.name for m in genai.list_models()]
-        model_name = "gemini-1.5-flash" # Default
+        time.sleep(10) # Essential buffer
+
+        # NEW FIX: Trying multiple model IDs to bypass versioning issues
+        # We start with the simple name which the new SDK prefers
+        model_name = "gemini-1.5-flash"
+        logger.info(f"Attempting model: {model_name}")
         
-        if "models/gemini-1.5-flash-latest" in available_models:
-            model_name = "gemini-1.5-flash-latest"
-        elif "models/gemini-1.5-flash" in available_models:
-            model_name = "gemini-1.5-flash"
-        
-        logger.info(f"Using model: {model_name}")
+        safety_settings = {
+            cat: HarmBlockThreshold.BLOCK_NONE for cat in [
+                HarmCategory.HARM_CATEGORY_HARASSMENT, HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT
+            ]
+        }
+
+        # Initialize model
         model = genai.GenerativeModel(model_name=model_name)
-        
         prompt = (
             "Analyze this recording. Detect language (Hebrew or English). Respond ONLY in that language. "
             "Structure: **Client Name:** [Name] **Summary:** [Summary] **Business Plan:** [Plan]"
         )
-        response = model.generate_content([file_upload, prompt])
-        result_text = response.text
+        
+        # Call with fallback
+        try:
+            response = model.generate_content([file_upload, prompt], safety_settings=safety_settings)
+            result_text = response.text
+        except Exception as e:
+            if "404" in str(e):
+                logger.warning("Primary model failed. Trying fallback model name...")
+                model = genai.GenerativeModel(model_name="gemini-1.5-flash-latest")
+                response = model.generate_content([file_upload, prompt], safety_settings=safety_settings)
+                result_text = response.text
+            else:
+                raise e
 
-        # ALWAYS LOG RESULT (Safety Net)
+        # ALWAYS LOG RESULT
         print("\n" + "="*60 + f"\nANALYSIS FOR {zoom_id}\n" + "-"*60 + f"\n{result_text}\n" + "="*60 + "\n")
 
-        # 4. NAME FALLBACK
+        # 4. NAME FALLBACK & UPLOAD
         if not contact_id:
-            logger.info("Contact ID empty. Searching GHL by AI Name...")
             for line in result_text.split('\n'):
                 if "**Client Name:**" in line:
                     detected_name = line.split(":**")[-1].strip()
@@ -167,11 +179,10 @@ def process_recording_logic(download_url: str, zoom_id: str, zoom_uuid: str, dow
                     if contacts: contact_id = contacts[0]["id"]
                     break
 
-        # 5. UPLOAD
         if contact_id:
             url = f"{GHL_BASE_URL}/contacts/{contact_id}/notes"
             requests.post(url, headers={"Authorization": f"Bearer {GHL_API_KEY}"}, json={"body": result_text})
-            logger.info(f"SUCCESS: Analysis uploaded to GHL Contact {contact_id}")
+            logger.info(f"SUCCESS: Note uploaded to Contact {contact_id}")
         else:
             logger.error("GHL ERROR: No contact found. FULL PLAN IS LOGGED ABOVE.")
 
@@ -199,9 +210,9 @@ async def zoom_webhook(request: Request, background_tasks: BackgroundTasks):
         payload = data.get("payload", {}).get("object", {})
         zoom_uuid = str(payload.get("uuid"))
 
-        if zoom_uuid in PROCESSED_UUIDS:
-            logger.info(f"Skipping duplicate for {zoom_uuid}")
-            return {"status": "skipped"}
+        if zoom_uuid in PROCESSED_UUIDS: return {"status": "skipped"}
+        if payload.get("duration", 0) < 2: return {"status": "too_short"}
+        
         PROCESSED_UUIDS.add(zoom_uuid)
 
         files = payload.get("recording_files", [])
