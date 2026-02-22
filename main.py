@@ -20,9 +20,6 @@ from google.generativeai.types import HarmCategory, HarmBlockThreshold
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Verify library version in logs
-logger.info(f"Google Generative AI Library Version: {genai.__version__}")
-
 ZOOM_ACCOUNT_ID = os.getenv("ZOOM_ACCOUNT_ID")
 ZOOM_CLIENT_ID = os.getenv("ZOOM_CLIENT_ID")
 ZOOM_CLIENT_SECRET = os.getenv("ZOOM_CLIENT_SECRET")
@@ -33,6 +30,7 @@ GHL_LOCATION_ID = os.getenv("GHL_LOCATION_ID")
 GHL_BASE_URL = "https://api.gohighlevel.com/v1"
 
 GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY")
+# Force the library to use the stable V1 API
 genai.configure(api_key=GOOGLE_API_KEY)
 
 HOST_EMAILS = ["support@fullbookai.com", "ofer.rapaport@gmail.com"]
@@ -55,7 +53,7 @@ def get_guest_email_from_zoom(meeting_uuid: str) -> Optional[str]:
     token = get_zoom_access_token()
     if not token: return None
     
-    # Correct Double-Encoding for Zoom UUIDs
+    # Proper Double-Encoding for UUIDs
     encoded_uuid = urllib.parse.quote(urllib.parse.quote(meeting_uuid, safe=''), safe='')
     url = f"https://api.zoom.us/v2/report/meetings/{encoded_uuid}/participants"
     
@@ -63,12 +61,13 @@ def get_guest_email_from_zoom(meeting_uuid: str) -> Optional[str]:
         headers = {"Authorization": f"Bearer {token}"}
         response = requests.get(url, headers=headers)
         data = response.json()
-        participants = data.get("participants", [])
         
-        logger.info(f"--- ZOOM ATTENDEES FOR {meeting_uuid} ---")
-        if not participants:
-            logger.warning(f"Zoom API returned no participants. Response: {data}")
+        if response.status_code != 200:
+            logger.warning(f"Zoom API Error: {data.get('message')}. Did you add the 'report:read' scope?")
+            return None
 
+        participants = data.get("participants", [])
+        logger.info(f"--- ZOOM ATTENDEES FOR {meeting_uuid} ---")
         for p in participants:
             email = p.get("user_email")
             name = p.get("name")
@@ -77,7 +76,7 @@ def get_guest_email_from_zoom(meeting_uuid: str) -> Optional[str]:
                 return email.lower()
         return None
     except Exception as e:
-        logger.error(f"Zoom API Error: {e}")
+        logger.error(f"Zoom Participant Fetch Error: {e}")
         return None
 
 def find_client_by_appointment(zoom_id: str) -> Optional[str]:
@@ -139,22 +138,25 @@ def process_recording_logic(download_url: str, zoom_id: str, zoom_uuid: str, dow
         
         time.sleep(10) # Indexing buffer
 
-        # THE ULTIMATE MODEL FIX: 
-        # We list models to the log so we can see what the API key actually sees.
-        try:
-            m_list = [m.name for m in genai.list_models()]
-            logger.info(f"Visible Models: {m_list}")
-        except: pass
+        # MODEL PICKER (Based on your visible list)
+        available_models = [m.name for m in genai.list_models()]
+        
+        if "models/gemini-2.0-flash" in available_models:
+            target_model = "models/gemini-2.0-flash"
+        elif "models/gemini-flash-latest" in available_models:
+            target_model = "models/gemini-flash-latest"
+        else:
+            # Last fallback
+            target_model = "models/gemini-1.5-flash"
 
-        # Force the most stable model ID
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        logger.info(f"Using identified model: {target_model}")
+        model = genai.GenerativeModel(model_name=target_model)
         
         prompt = (
             "Analyze this recording. Detect language (Hebrew or English). Respond ONLY in that language. "
             "Structure: **Client Name:** [Name] **Summary:** [Summary] **Business Plan:** [Plan]"
         )
         
-        # Call without safety filters to prevent empty responses
         safety_settings = {
             HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
@@ -170,7 +172,7 @@ def process_recording_logic(download_url: str, zoom_id: str, zoom_uuid: str, dow
 
         # 4. NAME FALLBACK & UPLOAD
         if not contact_id:
-            logger.info("No contact yet. Trying AI Name Match...")
+            logger.info("No contact matched. Trying AI Name Lookup...")
             for line in result_text.split('\n'):
                 if "**Client Name:**" in line:
                     detected_name = line.split(":**")[-1].strip()
@@ -195,7 +197,7 @@ def process_recording_logic(download_url: str, zoom_id: str, zoom_uuid: str, dow
         if file_upload: genai.delete_file(file_upload.name)
 
 # ------------------------------------------------------------------------------
-# WEBHOOK & HOME
+# WEBHOOK
 # ------------------------------------------------------------------------------
 
 @app.post("/zoom-webhook")
