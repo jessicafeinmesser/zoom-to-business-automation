@@ -6,7 +6,7 @@ import json
 import time
 import tempfile
 import requests
-import urllib.parse  # Added for proper encoding
+import urllib.parse
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Set
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
@@ -19,6 +19,9 @@ from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Verify library version in logs
+logger.info(f"Google Generative AI Library Version: {genai.__version__}")
 
 ZOOM_ACCOUNT_ID = os.getenv("ZOOM_ACCOUNT_ID")
 ZOOM_CLIENT_ID = os.getenv("ZOOM_CLIENT_ID")
@@ -52,20 +55,24 @@ def get_guest_email_from_zoom(meeting_uuid: str) -> Optional[str]:
     token = get_zoom_access_token()
     if not token: return None
     
-    # NEW FIX: Zoom UUIDs with + or / require DOUBLE encoding
-    # This turns '+fZU...' into '%252BfZU...'
+    # Correct Double-Encoding for Zoom UUIDs
     encoded_uuid = urllib.parse.quote(urllib.parse.quote(meeting_uuid, safe=''), safe='')
-    
     url = f"https://api.zoom.us/v2/report/meetings/{encoded_uuid}/participants"
+    
     try:
         headers = {"Authorization": f"Bearer {token}"}
         response = requests.get(url, headers=headers)
-        participants = response.json().get("participants", [])
+        data = response.json()
+        participants = data.get("participants", [])
         
         logger.info(f"--- ZOOM ATTENDEES FOR {meeting_uuid} ---")
+        if not participants:
+            logger.warning(f"Zoom API returned no participants. Response: {data}")
+
         for p in participants:
             email = p.get("user_email")
-            logger.info(f"Attendee: {p.get('name')} | Email: {email}")
+            name = p.get("name")
+            logger.info(f"Attendee: {name} | Email: {email}")
             if email and email.lower() not in [e.lower() for e in HOST_EMAILS]:
                 return email.lower()
         return None
@@ -130,45 +137,40 @@ def process_recording_logic(download_url: str, zoom_id: str, zoom_uuid: str, dow
             time.sleep(5)
             file_upload = genai.get_file(file_upload.name)
         
-        time.sleep(10) # Essential buffer
+        time.sleep(10) # Indexing buffer
 
-        # NEW FIX: Trying multiple model IDs to bypass versioning issues
-        # We start with the simple name which the new SDK prefers
-        model_name = "gemini-1.5-flash"
-        logger.info(f"Attempting model: {model_name}")
+        # THE ULTIMATE MODEL FIX: 
+        # We list models to the log so we can see what the API key actually sees.
+        try:
+            m_list = [m.name for m in genai.list_models()]
+            logger.info(f"Visible Models: {m_list}")
+        except: pass
+
+        # Force the most stable model ID
+        model = genai.GenerativeModel('gemini-1.5-flash')
         
-        safety_settings = {
-            cat: HarmBlockThreshold.BLOCK_NONE for cat in [
-                HarmCategory.HARM_CATEGORY_HARASSMENT, HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT
-            ]
-        }
-
-        # Initialize model
-        model = genai.GenerativeModel(model_name=model_name)
         prompt = (
             "Analyze this recording. Detect language (Hebrew or English). Respond ONLY in that language. "
             "Structure: **Client Name:** [Name] **Summary:** [Summary] **Business Plan:** [Plan]"
         )
         
-        # Call with fallback
-        try:
-            response = model.generate_content([file_upload, prompt], safety_settings=safety_settings)
-            result_text = response.text
-        except Exception as e:
-            if "404" in str(e):
-                logger.warning("Primary model failed. Trying fallback model name...")
-                model = genai.GenerativeModel(model_name="gemini-1.5-flash-latest")
-                response = model.generate_content([file_upload, prompt], safety_settings=safety_settings)
-                result_text = response.text
-            else:
-                raise e
+        # Call without safety filters to prevent empty responses
+        safety_settings = {
+            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+        }
+
+        response = model.generate_content([file_upload, prompt], safety_settings=safety_settings)
+        result_text = response.text
 
         # ALWAYS LOG RESULT
         print("\n" + "="*60 + f"\nANALYSIS FOR {zoom_id}\n" + "-"*60 + f"\n{result_text}\n" + "="*60 + "\n")
 
         # 4. NAME FALLBACK & UPLOAD
         if not contact_id:
+            logger.info("No contact yet. Trying AI Name Match...")
             for line in result_text.split('\n'):
                 if "**Client Name:**" in line:
                     detected_name = line.split(":**")[-1].strip()
@@ -193,7 +195,7 @@ def process_recording_logic(download_url: str, zoom_id: str, zoom_uuid: str, dow
         if file_upload: genai.delete_file(file_upload.name)
 
 # ------------------------------------------------------------------------------
-# WEBHOOK
+# WEBHOOK & HOME
 # ------------------------------------------------------------------------------
 
 @app.post("/zoom-webhook")
