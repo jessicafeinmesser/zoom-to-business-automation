@@ -62,10 +62,12 @@ def get_guest_email_from_zoom(meeting_uuid: str) -> Optional[str]:
         participants = response.json().get("participants", [])
         
         # LOG ALL PARTICIPANTS FOR DEBUGGING
+        logger.info(f"--- ZOOM ATTENDEES FOR {safe_uuid} ---")
         for p in participants:
-            logger.info(f"Zoom Attendee: {p.get('name')} | Email: {p.get('user_email')}")
-            
             email = p.get("user_email")
+            name = p.get("name")
+            logger.info(f"Attendee: {name} | Email: {email}")
+            
             if email and email.lower() not in [e.lower() for e in HOST_EMAILS]:
                 return email.lower()
         return None
@@ -85,8 +87,7 @@ def find_client_by_appointment(zoom_id: str) -> Optional[str]:
         clean_id = str(zoom_id).replace("-", "")
         for appt in appts:
             blob = (str(appt.get("location", "")) + str(appt.get("title", ""))).replace("-", "")
-            if clean_id in blob:
-                return appt.get("contactId")
+            if clean_id in blob: return appt.get("contactId")
         return None
     except: return None
 
@@ -114,8 +115,8 @@ def process_recording_logic(download_url: str, zoom_id: str, zoom_uuid: str, dow
                 logger.info(f"Matched contact via Email: {guest_email}")
         
         if not contact_id:
+            logger.info("Email check failed. Falling back to Appointment search...")
             contact_id = find_client_by_appointment(zoom_id)
-            if contact_id: logger.info(f"Matched contact via GHL Appointment.")
 
         # 2. DOWNLOAD
         auth_url = f"{download_url}?access_token={download_token}"
@@ -125,14 +126,23 @@ def process_recording_logic(download_url: str, zoom_id: str, zoom_uuid: str, dow
                 r.raise_for_status()
                 for chunk in r.iter_content(chunk_size=16384): tmp.write(chunk)
         
-        # 3. GEMINI
+        # 3. GEMINI (Model Auto-Detection)
         file_upload = genai.upload_file(temp_file_path, mime_type="video/mp4")
         while file_upload.state.name == "PROCESSING":
             time.sleep(5)
             file_upload = genai.get_file(file_upload.name)
         
-        # FIXED MODEL NAME STRING
-        model = genai.GenerativeModel(model_name="models/gemini-1.5-flash")
+        # Dynamically find the correct model name
+        available_models = [m.name for m in genai.list_models()]
+        model_name = "gemini-1.5-flash" # Default
+        
+        if "models/gemini-1.5-flash-latest" in available_models:
+            model_name = "gemini-1.5-flash-latest"
+        elif "models/gemini-1.5-flash" in available_models:
+            model_name = "gemini-1.5-flash"
+        
+        logger.info(f"Using model: {model_name}")
+        model = genai.GenerativeModel(model_name=model_name)
         
         prompt = (
             "Analyze this recording. Detect language (Hebrew or English). Respond ONLY in that language. "
@@ -141,11 +151,12 @@ def process_recording_logic(download_url: str, zoom_id: str, zoom_uuid: str, dow
         response = model.generate_content([file_upload, prompt])
         result_text = response.text
 
-        # ALWAYS LOG RESULT
+        # ALWAYS LOG RESULT (Safety Net)
         print("\n" + "="*60 + f"\nANALYSIS FOR {zoom_id}\n" + "-"*60 + f"\n{result_text}\n" + "="*60 + "\n")
 
         # 4. NAME FALLBACK
         if not contact_id:
+            logger.info("Contact ID empty. Searching GHL by AI Name...")
             for line in result_text.split('\n'):
                 if "**Client Name:**" in line:
                     detected_name = line.split(":**")[-1].strip()
@@ -162,15 +173,13 @@ def process_recording_logic(download_url: str, zoom_id: str, zoom_uuid: str, dow
             requests.post(url, headers={"Authorization": f"Bearer {GHL_API_KEY}"}, json={"body": result_text})
             logger.info(f"SUCCESS: Analysis uploaded to GHL Contact {contact_id}")
         else:
-            logger.error("GHL ERROR: No contact found. Full plan is logged above.")
+            logger.error("GHL ERROR: No contact found. FULL PLAN IS LOGGED ABOVE.")
 
     except Exception as e:
         logger.error(f"Critical Processing Error: {e}")
     finally:
         if temp_file_path and os.path.exists(temp_file_path): os.remove(temp_file_path)
         if file_upload: genai.delete_file(file_upload.name)
-        # Remove from processed list after 10 mins to allow for future tests
-        time.sleep(1) 
 
 # ------------------------------------------------------------------------------
 # WEBHOOK
@@ -190,26 +199,17 @@ async def zoom_webhook(request: Request, background_tasks: BackgroundTasks):
         payload = data.get("payload", {}).get("object", {})
         zoom_uuid = str(payload.get("uuid"))
 
-        # DE-DUPLICATION CHECK
         if zoom_uuid in PROCESSED_UUIDS:
-            logger.info(f"Skipping duplicate webhook for UUID: {zoom_uuid}")
-            return {"status": "already_processing"}
-        
+            logger.info(f"Skipping duplicate for {zoom_uuid}")
+            return {"status": "skipped"}
         PROCESSED_UUIDS.add(zoom_uuid)
 
         files = payload.get("recording_files", [])
-        # Favor the Speaker View MP4
         mp4_file = next((f for f in files if f.get("file_type") == "MP4" and "speaker" in f.get("recording_type", "").lower()), None)
         if not mp4_file: mp4_file = next((f for f in files if f.get("file_type") == "MP4"), None)
 
         if mp4_file:
-            background_tasks.add_task(
-                process_recording_logic, 
-                mp4_file.get("download_url"), 
-                str(payload.get("id")), 
-                zoom_uuid, 
-                data.get("download_token")
-            )
+            background_tasks.add_task(process_recording_logic, mp4_file.get("download_url"), str(payload.get("id")), zoom_uuid, data.get("download_token"))
             return {"status": "queued"}
     return {"status": "ignored"}
 
