@@ -30,10 +30,9 @@ GHL_LOCATION_ID = os.getenv("GHL_LOCATION_ID")
 GHL_BASE_URL = "https://api.gohighlevel.com/v1"
 
 GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY")
-# Force the library to use the stable V1 API
 genai.configure(api_key=GOOGLE_API_KEY)
 
-HOST_EMAILS = ["support@fullbookai.com", "ofer.rapaport@gmail.com"]
+HOST_EMAILS = ["support@fullbookai.com", "ofer.rapaport@gmail.com", "info@fullbookai.com"]
 PROCESSED_UUIDS: Set[str] = set()
 
 app = FastAPI()
@@ -53,7 +52,6 @@ def get_guest_email_from_zoom(meeting_uuid: str) -> Optional[str]:
     token = get_zoom_access_token()
     if not token: return None
     
-    # Proper Double-Encoding for UUIDs
     encoded_uuid = urllib.parse.quote(urllib.parse.quote(meeting_uuid, safe=''), safe='')
     url = f"https://api.zoom.us/v2/report/meetings/{encoded_uuid}/participants"
     
@@ -63,7 +61,7 @@ def get_guest_email_from_zoom(meeting_uuid: str) -> Optional[str]:
         data = response.json()
         
         if response.status_code != 200:
-            logger.warning(f"Zoom API Error: {data.get('message')}. Did you add the 'report:read' scope?")
+            logger.warning(f"Zoom API Scope Missing: Go to Zoom Marketplace and add 'report:read:list_meeting_participants:admin'")
             return None
 
         participants = data.get("participants", [])
@@ -76,7 +74,7 @@ def get_guest_email_from_zoom(meeting_uuid: str) -> Optional[str]:
                 return email.lower()
         return None
     except Exception as e:
-        logger.error(f"Zoom Participant Fetch Error: {e}")
+        logger.error(f"Zoom API Error: {e}")
         return None
 
 def find_client_by_appointment(zoom_id: str) -> Optional[str]:
@@ -138,18 +136,10 @@ def process_recording_logic(download_url: str, zoom_id: str, zoom_uuid: str, dow
         
         time.sleep(10) # Indexing buffer
 
-        # MODEL PICKER (Based on your visible list)
-        available_models = [m.name for m in genai.list_models()]
+        # MODEL PICKER: Using 1.5 Flash (stable free tier) instead of 2.0 (restricted)
+        target_model = "models/gemini-flash-latest" # This is 1.5 Flash
         
-        if "models/gemini-2.0-flash" in available_models:
-            target_model = "models/gemini-2.0-flash"
-        elif "models/gemini-flash-latest" in available_models:
-            target_model = "models/gemini-flash-latest"
-        else:
-            # Last fallback
-            target_model = "models/gemini-1.5-flash"
-
-        logger.info(f"Using identified model: {target_model}")
+        logger.info(f"Using stable free-tier model: {target_model}")
         model = genai.GenerativeModel(model_name=target_model)
         
         prompt = (
